@@ -1,0 +1,131 @@
+#include "control_system.h"
+#include "encoder.h"
+#include "motor.h"
+#include <stdio.h>
+
+int L_coder = 0, R_coder = 0;
+int Motor_A = 0, Motor_B = 0;
+int OverflowTime = 100;
+volatile uint32_t millis = 0;
+
+// 累计脉冲（用于测距离）
+long total_L = 0;
+long total_R = 0;
+
+// 状态机
+typedef enum {
+    GO_FORWARD = 0,   // 前进
+    GO_BACK,          // 返回
+    STOP
+} RunState;
+
+RunState state = GO_FORWARD;
+
+// 1米对应的脉冲数（需要根据实际标定，先给一个参考值）
+// 700线 * 4倍频 * 齿轮比，先按经验值，后面可调
+#define DISTANCE_1M_PULSE   2800    // 先试这个值，走不到1米就加大，超过就减小
+
+// 左轮PID
+int Incremental_PI_A(int Encoders_A, int Target_A)
+{
+    float Velocity_KP = 8.0f;      // 稍微加大一点
+    float Velocity_KD = 0.005f;
+
+    static int Pwm_A = 0;
+    static float Error_prev_A = 0;
+
+    float Error_A = (float)(Target_A - Encoders_A);
+
+    Pwm_A += Velocity_KP * Error_A + Velocity_KD * (Error_A - Error_prev_A);
+
+    if (Pwm_A > 7199)  Pwm_A = 7199;
+    if (Pwm_A < -7199) Pwm_A = -7199;
+
+    Error_prev_A = Error_A;
+    return Pwm_A;
+}
+
+// 右轮PID
+int Incremental_PI_B(int Encoders_B, int Target_B)
+{
+    float Velocity_KP = 8.0f;
+    float Velocity_KD = 0.005f;
+
+    static int Pwm_B = 0;
+    static float Error_prev_B = 0;
+
+    float Error_B = (float)(Target_B - Encoders_B);
+
+    Pwm_B += Velocity_KP * Error_B + Velocity_KD * (Error_B - Error_prev_B);
+
+    if (Pwm_B > 7199)  Pwm_B = 7199;
+    if (Pwm_B < -7199) Pwm_B = -7199;
+
+    Error_prev_B = Error_B;
+    return Pwm_B;
+}
+
+// 转/秒 → 脉冲
+int Rs_To_CPR(float rads)
+{
+    return (int)(rads * ((700.0f * 4) / (1000.0f / OverflowTime)));
+}
+
+// 系统控制
+void System_Control(void)
+{
+    int TageA = 0, TageB = 0;
+
+    // 读取编码器
+    L_coder = Read_Encoder(2);
+    R_coder = Read_Encoder(3);
+
+    // 累计脉冲（取绝对值，防止方向影响）
+    total_L += L_coder;
+    total_R += R_coder;
+
+    long avg_pulse = (total_L + total_R) / 2;
+
+    printf("pulse:%ld  state:%d\r\n", avg_pulse, state);
+
+    switch(state)
+    {
+        case GO_FORWARD:   // 前进
+            TageA = Rs_To_CPR(1.2f);     // 速度可调
+            TageB = Rs_To_CPR(-1.2f);    // 方向反了就两边都改符号
+
+            if (avg_pulse >= DISTANCE_1M_PULSE)
+            {
+                state = GO_BACK;
+                total_L = 0;
+                total_R = 0;
+                printf("到达1米，开始返回\r\n");
+            }
+            break;
+
+        case GO_BACK:      // 返回原点
+            TageA = Rs_To_CPR(-1.2f);
+            TageB = Rs_To_CPR(1.2f);
+
+            if (avg_pulse >= DISTANCE_1M_PULSE)
+            {
+                state = STOP;
+                printf("已返回原点，停止\r\n");
+            }
+            break;
+
+        case STOP:
+            TageA = 0;
+            TageB = 0;
+            break;
+    }
+
+    // PID计算
+    Motor_A = Incremental_PI_A(L_coder, TageA);
+    Motor_B = Incremental_PI_B(R_coder, TageB);
+
+    // 输出
+    Set_Pwm(Motor_A, Motor_B);
+}
+
+小车前进一米后返回

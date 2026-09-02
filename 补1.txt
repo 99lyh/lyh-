@@ -1,0 +1,170 @@
+#include <stdio.h>
+#include <unistd.h>
+#include "ohos_init.h"
+#include "wifiiot_gpio.h"
+#include "wifiiot_gpio_ex.h"
+#include <stdlib.h>
+#include <memory.h>
+#include "cmsis_os2.h"
+#include "hi_io.h"
+#include "hi_time.h"
+
+// 红外传感器引脚
+#define GPIOL 13
+#define GPIOR 14
+
+// 电机控制引脚
+#define GPIO_LEFT_A   0
+#define GPIO_LEFT_B   1
+#define GPIO_RIGHT_A  9
+#define GPIO_RIGHT_B  10
+
+// 全局变量
+osTimerId_t id_scan;
+uint32_t timerDelay;
+osStatus_t status;
+
+// 状态标志：0=前进模式，1=后退模式
+int car_mode = 0;   // 0: 前进   1: 后退
+
+// ===================== 电机控制函数 =====================
+void gpio_control(unsigned int gpio, WifiIotGpioValue value)
+{
+    IoSetFunc(gpio, 0);
+    GpioSetDir(gpio, WIFI_IOT_GPIO_DIR_OUT);
+    GpioSetOutputVal(gpio, value);
+}
+
+// 前进
+void car_forward(void)
+{
+    gpio_control(GPIO_LEFT_A,  WIFI_IOT_GPIO_VALUE1);
+    gpio_control(GPIO_LEFT_B,  WIFI_IOT_GPIO_VALUE0);
+    gpio_control(GPIO_RIGHT_A, WIFI_IOT_GPIO_VALUE1);
+    gpio_control(GPIO_RIGHT_B, WIFI_IOT_GPIO_VALUE0);
+}
+
+// 后退
+void car_backward(void)
+{
+    gpio_control(GPIO_LEFT_A,  WIFI_IOT_GPIO_VALUE0);
+    gpio_control(GPIO_LEFT_B,  WIFI_IOT_GPIO_VALUE1);
+    gpio_control(GPIO_RIGHT_A, WIFI_IOT_GPIO_VALUE0);
+    gpio_control(GPIO_RIGHT_B, WIFI_IOT_GPIO_VALUE1);
+}
+
+// 停止
+void car_stop(void)
+{
+    gpio_control(GPIO_LEFT_A,  WIFI_IOT_GPIO_VALUE1);
+    gpio_control(GPIO_LEFT_B,  WIFI_IOT_GPIO_VALUE1);
+    gpio_control(GPIO_RIGHT_A, WIFI_IOT_GPIO_VALUE1);
+    gpio_control(GPIO_RIGHT_B, WIFI_IOT_GPIO_VALUE1);
+}
+
+// ===================== 红外检测 + 控制逻辑 =====================
+void get_tcrt5000_value(void)
+{
+    WifiIotGpioValue left_status, right_status;
+
+    GpioGetInputVal(GPIOL, &left_status);
+    GpioGetInputVal(GPIOR, &right_status);
+
+    // 打印传感器状态
+    if (left_status == WIFI_IOT_GPIO_VALUE0) {
+        printf("left black  ");
+    } else {
+        printf("left white  ");
+    }
+
+    if (right_status == WIFI_IOT_GPIO_VALUE0) {
+        printf("right black\r\n");
+    } else {
+        printf("right white\r\n");
+    }
+
+    // ========== 核心逻辑 ==========
+    // 如果当前是前进模式
+    if (car_mode == 0) {
+        // 检测到任何一边是白色（边缘）
+        if (left_status != WIFI_IOT_GPIO_VALUE0 || right_status != WIFI_IOT_GPIO_VALUE0) {
+            car_stop();                     // 先停止
+            printf("→ 检测到边缘，停止！切换为后退模式\r\n");
+            car_mode = 1;                   // 切换到后退模式
+        } else {
+            car_forward();                  // 两边都是黑色，继续前进
+            printf("→ 前进中\r\n");
+        }
+    }
+    // 如果当前是后退模式
+    else {
+        car_backward();                     // 一直后退
+        printf("→ 后退中\r\n");
+    }
+}
+
+// 定时器回调
+void Timer_Scan_Callback(void *arg)
+{
+    (void)arg;
+    get_tcrt5000_value();
+}
+
+// 任务函数
+static void TCRTTask(void)
+{
+    printf("=== 小车启动：前进 → 遇边缘停止 → 一直后退 ===\r\n");
+
+    id_scan = osTimerNew(Timer_Scan_Callback, osTimerPeriodic, NULL, NULL);
+    if (id_scan != NULL) {
+        timerDelay = 50;          // 约0.5秒扫描一次，可调小更灵敏
+        status = osTimerStart(id_scan, timerDelay);
+        if (status == osOK) {
+            printf("扫描定时器启动成功\r\n");
+        }
+    }
+}
+
+// 初始化
+void TCRT(void)
+{
+    GpioInit();
+
+    // 红外传感器初始化
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_13, WIFI_IOT_IO_FUNC_GPIO_13_GPIO);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_14, WIFI_IOT_IO_FUNC_GPIO_14_GPIO);
+    GpioSetDir(WIFI_IOT_IO_NAME_GPIO_13, WIFI_IOT_GPIO_DIR_IN);
+    GpioSetDir(WIFI_IOT_IO_NAME_GPIO_14, WIFI_IOT_GPIO_DIR_IN);
+
+    // 电机GPIO初始化
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_0,  WIFI_IOT_IO_FUNC_GPIO_0_GPIO);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_1,  WIFI_IOT_IO_FUNC_GPIO_1_GPIO);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_9,  WIFI_IOT_IO_FUNC_GPIO_9_GPIO);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_10, WIFI_IOT_IO_FUNC_GPIO_10_GPIO);
+    GpioSetDir(WIFI_IOT_IO_NAME_GPIO_0,  WIFI_IOT_GPIO_DIR_OUT);
+    GpioSetDir(WIFI_IOT_IO_NAME_GPIO_1,  WIFI_IOT_GPIO_DIR_OUT);
+    GpioSetDir(WIFI_IOT_IO_NAME_GPIO_9,  WIFI_IOT_GPIO_DIR_OUT);
+    GpioSetDir(WIFI_IOT_IO_NAME_GPIO_10, WIFI_IOT_GPIO_DIR_OUT);
+
+    car_stop();     // 初始停止
+
+    osThreadAttr_t attr;
+    attr.name = "TCRTTask";
+    attr.attr_bits = 0U;
+    attr.cb_mem = NULL;
+    attr.cb_size = 0U;
+    attr.stack_mem = NULL;
+    attr.stack_size = 10240;
+    attr.priority = 25;
+
+    if (osThreadNew((osThreadFunc_t)TCRTTask, NULL, &attr) == NULL) {
+        printf("Failed to create TCRTTask!\n");
+    }
+}
+
+APP_FEATURE_INIT(TCRT);
+
+
+
+
+控制小车一直走遇到危险后退
